@@ -24,6 +24,8 @@
 
 using System;
 using System.Collections.Generic;
+using System.Drawing;
+using System.Linq;
 using ClearCanvas.Common;
 using ClearCanvas.Common.Utilities;
 using ClearCanvas.ImageViewer.BaseTools;
@@ -57,7 +59,7 @@ namespace ClearCanvas.ImageViewer.Layout.Basic
 
 	    private ListObserver<IImageBox> _imageBoxesObserver;
 		private object _unexplodeMemento;
-		private IImageBox _oldImageBox;
+        private Dictionary<IImageBox, IImageBox> _oldImageBoxMap = new Dictionary<IImageBox, IImageBox>();
 
 		public ExplodeImageBoxTool()
 		{
@@ -97,8 +99,16 @@ namespace ClearCanvas.ImageViewer.Layout.Basic
 			base.Dispose(disposing);
 		}
 
+		List<IImageBox> imageBoxHistory = new List<IImageBox>();
+
 		protected override void OnTileSelected(object sender, TileSelectedEventArgs e)
 		{
+			if (!Checked && null != e.SelectedTile &&
+				CanExplodeImageBox(e.SelectedTile.ParentImageBox))
+			{
+				imageBoxHistory.Remove(e.SelectedTile.ParentImageBox);
+				imageBoxHistory.Add(e.SelectedTile.ParentImageBox);
+			}
 			UpdateEnabled();
 		}
 
@@ -131,7 +141,7 @@ namespace ClearCanvas.ImageViewer.Layout.Basic
 		private void CancelExplodeMode()
 		{
 			_unexplodeMemento = null;
-			_oldImageBox = null;
+			_oldImageBoxMap = new Dictionary<IImageBox, IImageBox>();
 			OnCheckedChanged();
 		}
 
@@ -194,11 +204,12 @@ namespace ClearCanvas.ImageViewer.Layout.Basic
 
 		private void ExplodeImageBox()
 		{
-			IImageBox imageBox = ImageViewer.SelectedImageBox;
-			if (!CanExplodeImageBox(imageBox))
+			if (0 == imageBoxHistory.Count ||
+				!CanExplodeImageBox(ImageViewer.SelectedImageBox))
 				return;
 
-			IPhysicalWorkspace workspace = imageBox.ParentPhysicalWorkspace;
+
+			IPhysicalWorkspace workspace = ImageViewer.SelectedImageBox.ParentPhysicalWorkspace;
 			MemorableUndoableCommand memorableCommand = new MemorableUndoableCommand(workspace);
 			memorableCommand.BeginState = workspace.CreateMemento();
 
@@ -206,23 +217,25 @@ namespace ClearCanvas.ImageViewer.Layout.Basic
 
 			//set this here so checked will be correct.
 			_unexplodeMemento = memorableCommand.BeginState;
-			_oldImageBox = imageBox;
-			IDisplaySet displaySet = _oldImageBox.DisplaySet;
-			IPresentationImage selectedImage = _oldImageBox.SelectedTile.PresentationImage;
+			List<IImageBox> explodeImageBoxes =
+				new List<IImageBox>(imageBoxHistory.Skip(imageBoxHistory.Count - WorkspaceScreenCount()));
+			explodeImageBoxes.Reverse();
 
-			object imageBoxMemento = _oldImageBox.CreateMemento();
-			workspace.SetImageBoxGrid(1, 1);
-			IImageBox newImageBox = workspace.ImageBoxes[0];
-			newImageBox.SetMemento(imageBoxMemento);
+			List<object> mementoList = new List<object>();
+			foreach (IImageBox imageBox in explodeImageBoxes)
+			{
+				mementoList.Add(imageBox.CreateMemento());
+			}
 
-			//TODO (architecture): this wouldn't be necessary if we had a SetImageBoxGrid(imageBox[,]).
-			//This stuff with mementos is actually a hacky workaround.
-
-			bool locked = newImageBox.DisplaySetLocked;
-			newImageBox.DisplaySetLocked = false;
-			newImageBox.DisplaySet = displaySet;
-			newImageBox.TopLeftPresentationImage = selectedImage;
-			newImageBox.DisplaySetLocked = locked;
+			workspace.SetImageBoxGrid(1, explodeImageBoxes.Count);
+			int i = 0;
+			foreach (IImageBox imageBox in explodeImageBoxes)
+			{
+				IImageBox newImageBox = workspace.ImageBoxes[i];
+				_oldImageBoxMap.Add(imageBox, newImageBox);
+                newImageBox.SetMemento(mementoList[i]);
+				i++;
+			}
 
 			_imageBoxesObserver.SuppressChangedEvent = false;
 
@@ -241,27 +254,32 @@ namespace ClearCanvas.ImageViewer.Layout.Basic
 
 		private void UnexplodeImageBox()
 		{
-			IImageBox imageBox = ImageViewer.SelectedImageBox;
-			if (!CanUnexplodeImageBox(imageBox))
+			if (!CanUnexplodeImageBox(ImageViewer.SelectedImageBox))
 				return;
 
-			object imageBoxMemento = imageBox.CreateMemento();
+			IPhysicalWorkspace workspace = ImageViewer.SelectedImageBox.ParentPhysicalWorkspace;
 
-			IPhysicalWorkspace workspace = imageBox.ParentPhysicalWorkspace;
+			Dictionary<IImageBox, object> imageBoxMementoDictionary = new Dictionary<IImageBox, object>();
+			foreach(IImageBox imageBox in workspace.ImageBoxes)
+			{
+				imageBoxMementoDictionary.Add(imageBox, imageBox.CreateMemento());
+			}
+			Dictionary<IImageBox, IImageBox> oldMap = _oldImageBoxMap;
+
 			MemorableUndoableCommand memorableCommand = new MemorableUndoableCommand(workspace);
 			memorableCommand.BeginState = workspace.CreateMemento();
 
-			IImageBox oldImageBox = _oldImageBox;
-
 			workspace.SetMemento(_unexplodeMemento);
 
-			foreach (IImageBox box in workspace.ImageBoxes)
+			if(0 != oldMap.Count)
 			{
-				//Keep the state of the image box the same.
-				if (box == oldImageBox)
+				foreach (IImageBox box in workspace.ImageBoxes)
 				{
-					box.SetMemento(imageBoxMemento);
-					break;
+					//Keep the state of the image box the same.
+					if (oldMap.ContainsKey(box))
+					{
+						box.SetMemento(imageBoxMementoDictionary[oldMap[box]]);
+					}
 				}
 				
 			}
@@ -289,6 +307,18 @@ namespace ClearCanvas.ImageViewer.Layout.Basic
 				UnexplodeImageBox();
 			else
 				ExplodeImageBox();
+		}
+
+		private int WorkspaceScreenCount()
+		{
+			IPhysicalWorkspace workspace = ImageViewer.PhysicalWorkspace;
+			int count = 0;
+			foreach (Screen screen in Screen.AllScreens)
+			{
+				if (Rectangle.Intersect(screen.WorkingArea, workspace.ScreenRectangle).IsEmpty) { continue; }
+				count++;
+			}
+			return count;
 		}
 
 		internal static bool IsExploded(IImageViewer viewer)
